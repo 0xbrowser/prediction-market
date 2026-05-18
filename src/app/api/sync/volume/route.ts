@@ -1,5 +1,5 @@
 import type { VolumeResponseItem, VolumeWorkItem } from '@/app/api/sync/volume/helpers'
-import { and, asc, desc, eq, gt, inArray, lt, ne, notInArray, or, sql } from 'drizzle-orm'
+import { and, asc, eq, gt, inArray, lt, ne, notInArray, or, sql } from 'drizzle-orm'
 import { revalidateTag } from 'next/cache'
 import { NextResponse } from 'next/server'
 import {
@@ -20,7 +20,7 @@ import { db } from '@/lib/drizzle'
 
 export const maxDuration = 300
 
-const CLOB_URL = process.env.CLOB_URL!
+const CLOB_URL = (process.env.CLOB_URL ?? 'https://clob.kuest.com').replace(/\/+$/, '')
 const SYNC_RUNNING_STALE_MS = 15 * 60 * 1000
 const VOLUME_SYNC_SERVICE = 'volume_sync'
 const VOLUME_SYNC_SUBGRAPH = 'volume'
@@ -106,10 +106,20 @@ async function syncMarketVolumes(request: Request): Promise<VolumeSyncStats> {
 
   const batches = chunkVolumeWork(worklist.items, VOLUME_BATCH_SIZE)
   const updatedEventSlugs = new Set<string>()
+  let lastCompletedCursor = currentCursor
+
+  function markCursorItemAttempted(workItem: VolumeWorkItem) {
+    if (!workItem.advancesCursor) {
+      return
+    }
+
+    lastCompletedCursor = workItem.conditionId
+  }
 
   for (const batch of batches) {
     if (hasReachedTimeLimit(startedAt, Date.now(), SYNC_TIME_LIMIT_MS)) {
       stats.timeLimitReached = true
+      stats.nextCursor = lastCompletedCursor
       break
     }
 
@@ -124,6 +134,7 @@ async function syncMarketVolumes(request: Request): Promise<VolumeSyncStats> {
         const response = responseMap.get(workItem.conditionId)
         if (!response) {
           stats.errors.push({ context: `volume:${workItem.conditionId}`, error: 'missing_response' })
+          markCursorItemAttempted(workItem)
           continue
         }
 
@@ -132,11 +143,13 @@ async function syncMarketVolumes(request: Request): Promise<VolumeSyncStats> {
             context: `volume:${workItem.conditionId}`,
             error: response.error ?? `status_${response.status}`,
           })
+          markCursorItemAttempted(workItem)
           continue
         }
 
         if (response.volume == null) {
           stats.errors.push({ context: `volume:${workItem.conditionId}`, error: 'missing_volume_value' })
+          markCursorItemAttempted(workItem)
           continue
         }
 
@@ -148,6 +161,7 @@ async function syncMarketVolumes(request: Request): Promise<VolumeSyncStats> {
 
         if (!hasVolumeChanged) {
           stats.skipped++
+          markCursorItemAttempted(workItem)
           continue
         }
 
@@ -155,22 +169,27 @@ async function syncMarketVolumes(request: Request): Promise<VolumeSyncStats> {
           await updateMarketVolume(workItem.conditionId, totalVolume, volume24h)
           stats.updated++
           updatedEventSlugs.add(workItem.eventSlug)
+          markCursorItemAttempted(workItem)
         }
         catch (error: any) {
           stats.errors.push({
             context: `update:${workItem.conditionId}`,
             error: error?.message ?? 'failed_to_update_market',
           })
+          markCursorItemAttempted(workItem)
         }
       }
     }
     catch (error: any) {
       const firstId = batch[0]?.conditionId ?? 'unknown'
       const lastId = batch.at(-1)?.conditionId ?? 'unknown'
+      const message = error?.message ?? 'volume_batch_failed'
       stats.errors.push({
         context: `batch:${firstId}-${lastId}`,
-        error: error?.message ?? 'volume_batch_failed',
+        error: message,
       })
+      stats.nextCursor = lastCompletedCursor
+      break
     }
   }
 
@@ -199,11 +218,12 @@ async function buildVolumeWorklist(limit: number, cursor: string | null): Promis
   nextCursor: string | null
   wrappedAround: boolean
 }> {
-  const priorityLimit = Math.max(0, Math.min(limit - 1, ZERO_VOLUME_PRIORITY_LIMIT))
+  const priorityLimit = Math.min(Math.max(0, limit - 1), ZERO_VOLUME_PRIORITY_LIMIT)
   const priorityRows = await fetchZeroVolumeMarketRows(priorityLimit)
+  let wrappedAround = false
+
   const priorityConditionIds = priorityRows.map(market => market.condition_id)
   const remainingLimit = Math.max(0, limit - priorityRows.length)
-  let wrappedAround = false
   let cursorRows = remainingLimit > 0
     ? await fetchMarketRows(remainingLimit, cursor, priorityConditionIds)
     : []
@@ -216,6 +236,7 @@ async function buildVolumeWorklist(limit: number, cursor: string | null): Promis
   const marketRows = [...priorityRows, ...cursorRows]
   const nextCursor = cursorRows.at(-1)?.condition_id ?? cursor
   const conditionIds = marketRows.map(market => market.condition_id)
+  const cursorConditionIds = new Set(cursorRows.map(market => market.condition_id))
 
   let outcomesMap = new Map<string, string[]>()
   if (conditionIds.length > 0) {
@@ -251,6 +272,7 @@ async function buildVolumeWorklist(limit: number, cursor: string | null): Promis
       tokenIds: [uniqueTokens[0], uniqueTokens[1]],
       previousTotalVolume: market.volume ?? '0',
       previousVolume24h: market.volume_24h ?? '0',
+      advancesCursor: cursorConditionIds.has(market.condition_id),
     })
   }
 
@@ -282,6 +304,8 @@ async function fetchZeroVolumeMarketRows(limit: number) {
     return []
   }
 
+  const basePredicate = buildBaseMarketPredicate()
+
   return db
     .select({
       condition_id: markets.condition_id,
@@ -292,10 +316,10 @@ async function fetchZeroVolumeMarketRows(limit: number) {
     .from(markets)
     .innerJoin(events, eq(events.id, markets.event_id))
     .where(and(
-      buildBaseMarketPredicate(),
+      basePredicate,
       sql`${markets.volume} = 0`,
     ))
-    .orderBy(desc(markets.created_at), asc(markets.condition_id))
+    .orderBy(asc(markets.condition_id))
     .limit(limit)
 }
 
